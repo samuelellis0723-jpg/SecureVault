@@ -27,7 +27,7 @@ describe('API client (CSRF en memoria, credenciales same-origin y errores)', () 
     global.fetch = originalFetch;
   });
 
-  test('guarda csrf_token solo en memoria y envía X-CSRF-Token en POST, PATCH y DELETE', async () => {
+  test('guarda csrf_token solo en memoria desde me, register y login y envía X-CSRF-Token en POST, PATCH y DELETE', async () => {
     const setItemSpy = jest.spyOn(Storage.prototype, 'setItem');
     const getItemSpy = jest.spyOn(Storage.prototype, 'getItem');
 
@@ -39,8 +39,7 @@ describe('API client (CSRF en memoria, credenciales same-origin y errores)', () 
           success: true,
           data: {
             authenticated: true,
-            mfa_verified: true,
-            user: { id: 'u1', email: 'ana@ejemplo.com', totp_enabled: true },
+            user: { id: 'u1', email: 'ana@ejemplo.com' },
             csrf_token: 'csrf-token-inicial',
           },
         })
@@ -116,6 +115,40 @@ describe('API client (CSRF en memoria, credenciales same-origin y errores)', () 
 
     setItemSpy.mockRestore();
     getItemSpy.mockRestore();
+  });
+
+  test('register y login almacenan csrf_token en memoria y no exponen métodos TOTP', async () => {
+    expect(authApi.confirmTotp).toBeUndefined();
+    expect(authApi.verifyTotp).toBeUndefined();
+
+    global.fetch
+      .mockResolvedValueOnce(
+        createJsonResponse(
+          {
+            success: true,
+            data: {
+              user: { id: 'u-reg', email: 'nuevo@ejemplo.com' },
+              csrf_token: 'csrf-register',
+            },
+          },
+          201
+        )
+      )
+      .mockResolvedValueOnce(
+        createJsonResponse({
+          success: true,
+          data: {
+            user: { id: 'u-log', email: 'ana@ejemplo.com' },
+            csrf_token: 'csrf-login',
+          },
+        })
+      );
+
+    await authApi.register({ email: ' nuevo@ejemplo.com ', password: 'MiPasswordSegura#2026' });
+    expect(getCsrfToken()).toBe('csrf-register');
+
+    await authApi.login({ email: ' ana@ejemplo.com ', password: 'MiPasswordSegura#2026' });
+    expect(getCsrfToken()).toBe('csrf-login');
   });
 
   test('limpia csrf_token de memoria al cerrar sesión incluso si falla el servidor', async () => {

@@ -4,7 +4,6 @@ import { AlertBanner } from '../components/AlertBanner';
 import { Layout } from '../components/Layout';
 import { NoteForm } from '../components/NoteForm';
 import { NoteList } from '../components/NoteList';
-import { RecoveryCodesModal } from '../components/RecoveryCodesModal';
 import { useAuth } from '../context/AuthContext';
 
 const PAGE_LIMIT = 20;
@@ -17,11 +16,11 @@ const EMPTY_META = {
 };
 
 function isSessionAuthError(err) {
-  return err && (err.status === 401 || err.code === 'UNAUTHORIZED' || err.code === 'MFA_REQUIRED');
+  return err && (err.status === 401 || err.code === 'UNAUTHORIZED');
 }
 
 export function VaultPage() {
-  const { recoveryCodes, clearRecoveryCodes, resetSession } = useAuth();
+  const { resetSession } = useAuth();
 
   const [categoryFilter, setCategoryFilter] = useState('');
   const [page, setPage] = useState(1);
@@ -356,13 +355,6 @@ export function VaultPage() {
 
   return (
     <Layout>
-      {recoveryCodes && recoveryCodes.length > 0 && (
-        <RecoveryCodesModal
-          codes={recoveryCodes}
-          onConfirmSaved={clearRecoveryCodes}
-        />
-      )}
-
       <div className="sv-vault-header">
         <h1 className="sv-vault-title">Bóveda de notas cifradas</h1>
         <button

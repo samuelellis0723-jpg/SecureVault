@@ -24,16 +24,12 @@ export const CATEGORY_LABELS = {
 const FALLBACK_ERROR_MESSAGES = {
   VALIDATION_ERROR: 'Revisa los datos ingresados e inténtalo de nuevo.',
   UNAUTHORIZED: 'Tu sesión ha expirado. Inicia sesión nuevamente.',
-  MFA_REQUIRED: 'Debes completar la verificación de dos pasos (TOTP).',
   INVALID_CREDENTIALS: 'Correo electrónico o contraseña incorrectos.',
-  INVALID_TOTP_CODE: 'El código de 6 dígitos no es válido o ya expiró.',
-  INVALID_RECOVERY_CODE: 'El código de recuperación no es válido o ya fue utilizado.',
   CSRF_INVALID: 'La verificación de seguridad (CSRF) falló. Recarga e inténtalo de nuevo.',
   REGISTRATION_DISABLED: 'El registro de nuevas cuentas está deshabilitado.',
   FORBIDDEN: 'No tienes permiso para realizar esta acción.',
   NOT_FOUND: 'El recurso solicitado no existe o no está disponible.',
   EMAIL_ALREADY_EXISTS: 'Ya existe una cuenta registrada con este correo electrónico.',
-  TOTP_ALREADY_ENABLED: 'La autenticación de dos pasos ya está activada en esta cuenta.',
   ACCOUNT_LOCKED: 'Cuenta bloqueada temporalmente por demasiados intentos fallidos. Espera 15 minutos.',
   RATE_LIMITED: 'Demasiadas solicitudes. Espera un momento e inténtalo nuevamente.',
   INTERNAL_ERROR: 'Ocurrió un error interno en el servidor. Inténtalo más tarde.',
@@ -169,25 +165,6 @@ export const authApi = {
     const payload = await apiRequest('/auth/login', {
       method: 'POST',
       body: { email: email.trim(), password },
-    });
-    return payload.data;
-  },
-
-  async confirmTotp({ code }) {
-    const payload = await apiRequest('/auth/totp/confirm', {
-      method: 'POST',
-      body: { code: code.trim() },
-    });
-    return payload.data;
-  },
-
-  async verifyTotp({ code, recoveryCode }) {
-    const body = recoveryCode
-      ? { recovery_code: recoveryCode.trim() }
-      : { code: String(code || '').trim() };
-    const payload = await apiRequest('/auth/totp/verify', {
-      method: 'POST',
-      body,
     });
     return payload.data;
   },

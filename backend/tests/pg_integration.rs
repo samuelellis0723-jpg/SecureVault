@@ -8,19 +8,14 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use data_encoding::BASE32_NOPAD;
 use secrecy::{ExposeSecret, SecretString};
 use sqlx::{Row, migrate::Migrator};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use security_vault_backend::{
-    crypto::{
-        cipher::{KEY_LEN, KeyRing},
-        totp::generate_totp_at,
-    },
+    crypto::cipher::{KEY_LEN, KeyRing},
     domain::{error::AppError, models::NoteCategory},
     repositories::{VaultRepositories, pg::PgStore},
     services::{
@@ -37,15 +32,6 @@ fn make_key_ring(active_version: i16, versions: &[(i16, u8)]) -> KeyRing {
         keys.insert(ver, Zeroizing::new([byte; KEY_LEN]));
     }
     KeyRing::new(active_version, keys).unwrap()
-}
-
-fn current_totp_from_base32(secret_base32: &str) -> String {
-    let raw = BASE32_NOPAD.decode(secret_base32.as_bytes()).unwrap();
-    let unix_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    generate_totp_at(&raw, unix_secs).unwrap()
 }
 
 #[tokio::test]
@@ -88,7 +74,7 @@ async fn pg_end_to_end_migrations_auth_notes_bola_rotation_and_delete() {
     );
     let notes_v1 = NotesService::new(repos.clone(), ring_v1, alerts.clone());
 
-    // 2. Register and confirm TOTP for Alice and Bob (real PostgreSQL users + sessions + recovery codes)
+    // 2. Register Alice and Bob (direct full sessions in PostgreSQL without TOTP step)
     let run_id = Uuid::new_v4();
     let alice_email = format!("pg-alice-{run_id}@example.com");
     let bob_email = format!("pg-bob-{run_id}@example.com");
@@ -97,51 +83,37 @@ async fn pg_end_to_end_migrations_auth_notes_bola_rotation_and_delete() {
         .register(&alice_email, SecretString::from("AlicePgStrongPass#2026"))
         .await
         .unwrap();
-    let pre_session_alice = auth_v1
-        .authenticate_session(reg_alice.session_token.expose_secret())
-        .await
-        .unwrap();
-    assert!(!pre_session_alice.session.mfa_verified);
-
-    let alice_totp_code = current_totp_from_base32(&reg_alice.totp.secret_base32);
-    let confirmed_alice = auth_v1
-        .confirm_totp(
-            &pre_session_alice,
-            &alice_totp_code,
-            "127.0.0.1",
-            "pg-test-req-1",
-        )
-        .await
-        .unwrap();
-    assert_eq!(confirmed_alice.recovery_codes.len(), 8);
-    let alice_id = confirmed_alice.user.id;
+    let alice_id = reg_alice.user.id;
 
     let full_session_alice = auth_v1
-        .authenticate_session(confirmed_alice.session_token.expose_secret())
+        .authenticate_session(reg_alice.session_token.expose_secret())
         .await
         .unwrap();
     assert!(full_session_alice.session.mfa_verified);
     assert_eq!(full_session_alice.session.user_id, alice_id);
 
+    // Standard login also opens a full session immediately
+    let login_alice = auth_v1
+        .login(
+            &alice_email,
+            SecretString::from("AlicePgStrongPass#2026"),
+            "127.0.0.1",
+            "pg-test-login-1",
+        )
+        .await
+        .unwrap();
+    assert_eq!(login_alice.user.id, alice_id);
+    let login_session_alice = auth_v1
+        .authenticate_session(login_alice.session_token.expose_secret())
+        .await
+        .unwrap();
+    assert!(login_session_alice.session.mfa_verified);
+
     let reg_bob = auth_v1
         .register(&bob_email, SecretString::from("BobPgStrongPass#2026!"))
         .await
         .unwrap();
-    let pre_session_bob = auth_v1
-        .authenticate_session(reg_bob.session_token.expose_secret())
-        .await
-        .unwrap();
-    let bob_totp_code = current_totp_from_base32(&reg_bob.totp.secret_base32);
-    let confirmed_bob = auth_v1
-        .confirm_totp(
-            &pre_session_bob,
-            &bob_totp_code,
-            "127.0.0.1",
-            "pg-test-req-2",
-        )
-        .await
-        .unwrap();
-    let bob_id = confirmed_bob.user.id;
+    let bob_id = reg_bob.user.id;
 
     // 3. Create encrypted note for Alice and verify raw bytes in PostgreSQL contain no plaintext
     let secret_title = "Clave Banco PG";
@@ -258,11 +230,11 @@ async fn pg_end_to_end_migrations_auth_notes_bola_rotation_and_delete() {
     // 7. Logout revokes session in PostgreSQL
     auth_v1.logout(&full_session_alice).await.unwrap();
     let after_logout = auth_v1
-        .authenticate_session(confirmed_alice.session_token.expose_secret())
+        .authenticate_session(reg_alice.session_token.expose_secret())
         .await;
     assert!(matches!(after_logout, Err(AppError::Unauthorized(_))));
 
-    // 8. Clean up test rows (ON DELETE CASCADE removes sessions, notes, recovery codes)
+    // 8. Clean up test rows (ON DELETE CASCADE removes sessions and notes)
     sqlx::query("DELETE FROM users WHERE id = ANY($1)")
         .bind([alice_id, bob_id])
         .execute(pg_store.pool())

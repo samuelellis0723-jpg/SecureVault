@@ -87,9 +87,7 @@ pub fn build_router(state: AppState) -> Router {
 
     let api_v1 = Router::new()
         .route("/auth/register", post(auth_handlers::register))
-        .route("/auth/totp/confirm", post(auth_handlers::confirm_totp))
         .route("/auth/login", post(auth_handlers::login))
-        .route("/auth/totp/verify", post(auth_handlers::verify_totp))
         .route("/auth/logout", post(auth_handlers::logout))
         .route("/auth/me", get(auth_handlers::me))
         .route(
