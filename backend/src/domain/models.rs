@@ -130,7 +130,6 @@ impl fmt::Debug for UserRecord {
 pub struct UserPublic {
     pub id: Uuid,
     pub email: String,
-    pub totp_enabled: bool,
 }
 
 impl From<&UserRecord> for UserPublic {
@@ -138,7 +137,6 @@ impl From<&UserRecord> for UserPublic {
         Self {
             id: user.id,
             email: user.email.clone(),
-            totp_enabled: user.totp_enabled,
         }
     }
 }

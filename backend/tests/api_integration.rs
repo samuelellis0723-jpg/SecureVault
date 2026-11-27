@@ -5,14 +5,13 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use axum::{
     Router,
     body::{Body, to_bytes},
     http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header},
 };
-use data_encoding::BASE32_NOPAD;
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -23,10 +22,7 @@ use zeroize::Zeroizing;
 
 use security_vault_backend::{
     config::{AppConfig, AppEnv, WebhookFormat},
-    crypto::{
-        cipher::{KEY_LEN, KeyRing},
-        totp::{generate_totp_at, verify_totp_now},
-    },
+    crypto::cipher::{KEY_LEN, KeyRing},
     http::{AppState, build_router, middleware::RateLimitConfig},
     repositories::{VaultRepositories, memory::InMemoryStore},
     services::{
@@ -155,24 +151,13 @@ fn extract_cookie_value(headers: &HeaderMap) -> Option<String> {
     }
 }
 
-fn current_totp_from_base32(secret_base32: &str) -> String {
-    let raw = BASE32_NOPAD.decode(secret_base32.as_bytes()).unwrap();
-    let unix_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    generate_totp_at(&raw, unix_secs).unwrap()
-}
-
-struct EnrolledUser {
+struct RegisteredUser {
     user_id: Uuid,
     cookie: String,
     csrf_token: String,
-    secret_base32: String,
-    recovery_codes: Vec<String>,
 }
 
-async fn register_and_confirm_user(router: &Router, email: &str, password: &str) -> EnrolledUser {
+async fn register_user(router: &Router, email: &str, password: &str) -> RegisteredUser {
     let (status, headers, reg_body) = send_json(
         router,
         Method::POST,
@@ -185,53 +170,22 @@ async fn register_and_confirm_user(router: &Router, email: &str, password: &str)
     .await;
     assert_eq!(status, StatusCode::CREATED);
 
-    let pre_cookie = extract_cookie_value(&headers).unwrap();
-    let pre_csrf = reg_body["data"]["csrf_token"].as_str().unwrap().to_owned();
-    let secret_base32 = reg_body["data"]["totp"]["secret_base32"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    let cookie = extract_cookie_value(&headers).unwrap();
+    let csrf_token = reg_body["data"]["csrf_token"].as_str().unwrap().to_owned();
+    let user_id = Uuid::parse_str(reg_body["data"]["user"]["id"].as_str().unwrap()).unwrap();
 
-    let code = current_totp_from_base32(&secret_base32);
-    let (status, headers, confirm_body) = send_json(
-        router,
-        Method::POST,
-        "/api/v1/auth/totp/confirm",
-        Some(&pre_cookie),
-        Some(&pre_csrf),
-        Some("198.51.100.10"),
-        Some(json!({ "code": code })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-
-    let full_cookie = extract_cookie_value(&headers).unwrap();
-    let full_csrf = confirm_body["data"]["csrf_token"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let user_id = Uuid::parse_str(confirm_body["data"]["user"]["id"].as_str().unwrap()).unwrap();
-    let recovery_codes = confirm_body["data"]["recovery_codes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_str().unwrap().to_owned())
-        .collect();
-
-    EnrolledUser {
+    RegisteredUser {
         user_id,
-        cookie: full_cookie,
-        csrf_token: full_csrf,
-        secret_base32,
-        recovery_codes,
+        cookie,
+        csrf_token,
     }
 }
 
 #[tokio::test]
-async fn ca01_auth_register_confirm_totp_recovery_codes_and_vault_lifecycle() {
+async fn ca01_auth_register_and_direct_vault_lifecycle() {
     let harness = TestHarness::new();
 
-    // 1. Register
+    // 1. Register creates an immediately authenticated full session
     let (status, headers, reg_body) = send_json(
         &harness.router,
         Method::POST,
@@ -247,6 +201,9 @@ async fn ca01_auth_register_confirm_totp_recovery_codes_and_vault_lifecycle() {
     .await;
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(reg_body["success"], true);
+    assert_eq!(reg_body["data"]["user"]["email"], "alice@example.com");
+    assert!(reg_body["data"]["user"]["id"].as_str().is_some());
+    assert!(reg_body["data"].get("totp").is_none());
 
     let set_cookie = headers
         .get(header::SET_COOKIE)
@@ -257,14 +214,10 @@ async fn ca01_auth_register_confirm_totp_recovery_codes_and_vault_lifecycle() {
     assert!(set_cookie.contains("HttpOnly"));
     assert!(set_cookie.contains("SameSite=Strict"));
     assert!(set_cookie.contains("Path=/"));
+    assert!(set_cookie.contains("Max-Age=28800"));
 
-    let pre_cookie = extract_cookie_value(&headers).unwrap();
-    let pre_csrf = reg_body["data"]["csrf_token"].as_str().unwrap().to_owned();
-    let otpauth = reg_body["data"]["totp"]["otpauth_uri"].as_str().unwrap();
-    let secret_base32 = reg_body["data"]["totp"]["secret_base32"].as_str().unwrap();
-    let qr_svg = reg_body["data"]["totp"]["qr_svg"].as_str().unwrap();
-    assert!(otpauth.starts_with("otpauth://totp/SecurityVault:alice%40example.com?secret="));
-    assert!(qr_svg.contains("<svg"));
+    let full_cookie = extract_cookie_value(&headers).unwrap();
+    let full_csrf = reg_body["data"]["csrf_token"].as_str().unwrap().to_owned();
 
     // Duplicate email rejected with 409 EMAIL_ALREADY_EXISTS.
     let (dup_status, _, dup_body) = send_json(
@@ -283,48 +236,7 @@ async fn ca01_auth_register_confirm_totp_recovery_codes_and_vault_lifecycle() {
     assert_eq!(dup_status, StatusCode::CONFLICT);
     assert_eq!(dup_body["error"]["code"], "EMAIL_ALREADY_EXISTS");
 
-    // 2. Confirm TOTP with valid 6-digit code
-    let code = current_totp_from_base32(secret_base32);
-    let (status, headers, confirm_body) = send_json(
-        &harness.router,
-        Method::POST,
-        "/api/v1/auth/totp/confirm",
-        Some(&pre_cookie),
-        Some(&pre_csrf),
-        Some("198.51.100.1"),
-        Some(json!({ "code": code })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(confirm_body["data"]["user"]["email"], "alice@example.com");
-    assert_eq!(confirm_body["data"]["user"]["totp_enabled"], true);
-
-    let recovery_codes = confirm_body["data"]["recovery_codes"].as_array().unwrap();
-    assert_eq!(recovery_codes.len(), 8);
-
-    // Session & CSRF rotated (session fixation defense).
-    let full_cookie = extract_cookie_value(&headers).unwrap();
-    let full_csrf = confirm_body["data"]["csrf_token"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    assert_ne!(full_cookie, pre_cookie);
-    assert_ne!(full_csrf, pre_csrf);
-
-    // Old pre-MFA cookie is revoked.
-    let (old_status, _, _) = send_json(
-        &harness.router,
-        Method::GET,
-        "/api/v1/auth/me",
-        Some(&pre_cookie),
-        None,
-        None,
-        None,
-    )
-    .await;
-    assert_eq!(old_status, StatusCode::UNAUTHORIZED);
-
-    // 3. Rehydrate via /auth/me
+    // 2. Rehydrate via /auth/me
     let (me_status, _, me_body) = send_json(
         &harness.router,
         Method::GET,
@@ -337,10 +249,10 @@ async fn ca01_auth_register_confirm_totp_recovery_codes_and_vault_lifecycle() {
     .await;
     assert_eq!(me_status, StatusCode::OK);
     assert_eq!(me_body["data"]["authenticated"], true);
-    assert_eq!(me_body["data"]["mfa_verified"], true);
+    assert_eq!(me_body["data"]["user"]["email"], "alice@example.com");
     assert_eq!(me_body["data"]["csrf_token"], full_csrf);
 
-    // 4. Create -> Read -> Update -> Delete note
+    // 3. Create -> Read -> Update -> Delete note directly after register
     let (create_status, _, created) = send_json(
         &harness.router,
         Method::POST,
@@ -391,7 +303,7 @@ async fn ca01_auth_register_confirm_totp_recovery_codes_and_vault_lifecycle() {
     assert_eq!(del_status, StatusCode::OK);
     assert_eq!(del_body["data"]["deleted"], true);
 
-    // 5. Logout revokes session and clears cookie
+    // 4. Logout revokes session and clears cookie
     let (logout_status, logout_headers, logout_body) = send_json(
         &harness.router,
         Method::POST,
@@ -425,12 +337,53 @@ async fn ca01_auth_register_confirm_totp_recovery_codes_and_vault_lifecycle() {
 }
 
 #[tokio::test]
-async fn ca02_auth_login_2fa_blocks_pre_mfa_and_consumes_single_use_recovery_code() {
+async fn ca02_auth_login_unlocks_vault_directly_and_totp_routes_return_404() {
     let harness = TestHarness::new();
-    let user =
-        register_and_confirm_user(&harness.router, "bob@example.com", "BobStrongPass#2026").await;
+    let _user = register_user(&harness.router, "bob@example.com", "BobStrongPass#2026").await;
 
-    // Login step 1 -> pre-MFA session
+    // Unauthenticated access to /notes returns 401 UNAUTHORIZED
+    let (unauth_status, _, unauth_body) = send_json(
+        &harness.router,
+        Method::GET,
+        "/api/v1/notes",
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(unauth_status, StatusCode::UNAUTHORIZED);
+    assert_eq!(unauth_body["error"]["code"], "UNAUTHORIZED");
+
+    // Wrong password returns uniform 401 INVALID_CREDENTIALS
+    let (bad_pass_status, _, bad_pass_body) = send_json(
+        &harness.router,
+        Method::POST,
+        "/api/v1/auth/login",
+        None,
+        None,
+        Some("198.51.100.2"),
+        Some(json!({ "email": "bob@example.com", "password": "WrongPassword#2026" })),
+    )
+    .await;
+    assert_eq!(bad_pass_status, StatusCode::UNAUTHORIZED);
+    assert_eq!(bad_pass_body["error"]["code"], "INVALID_CREDENTIALS");
+
+    // Nonexistent email returns uniform 401 INVALID_CREDENTIALS (anti-enumeration)
+    let (missing_status, _, missing_body) = send_json(
+        &harness.router,
+        Method::POST,
+        "/api/v1/auth/login",
+        None,
+        None,
+        Some("198.51.100.2"),
+        Some(json!({ "email": "nobody@example.com", "password": "BobStrongPass#2026" })),
+    )
+    .await;
+    assert_eq!(missing_status, StatusCode::UNAUTHORIZED);
+    assert_eq!(missing_body["error"]["code"], "INVALID_CREDENTIALS");
+
+    // Standard login opens a full session and immediately unlocks /notes
     let (login_status, login_headers, login_body) = send_json(
         &harness.router,
         Method::POST,
@@ -442,43 +395,17 @@ async fn ca02_auth_login_2fa_blocks_pre_mfa_and_consumes_single_use_recovery_cod
     )
     .await;
     assert_eq!(login_status, StatusCode::OK);
-    assert_eq!(login_body["data"]["mfa_required"], true);
-    assert_eq!(login_body["data"]["totp_enrolled"], true);
+    assert_eq!(login_body["success"], true);
+    assert_eq!(login_body["data"]["user"]["email"], "bob@example.com");
+    assert!(login_body["data"]["csrf_token"].as_str().is_some());
+    assert!(login_body["data"].get("mfa_required").is_none());
 
-    let pre_cookie = extract_cookie_value(&login_headers).unwrap();
-    let pre_csrf = login_body["data"]["csrf_token"]
+    let full_cookie = extract_cookie_value(&login_headers).unwrap();
+    let full_csrf = login_body["data"]["csrf_token"]
         .as_str()
         .unwrap()
         .to_owned();
 
-    // Accessing /notes before MFA returns 401 MFA_REQUIRED
-    let (blocked_status, _, blocked_body) = send_json(
-        &harness.router,
-        Method::GET,
-        "/api/v1/notes",
-        Some(&pre_cookie),
-        None,
-        None,
-        None,
-    )
-    .await;
-    assert_eq!(blocked_status, StatusCode::UNAUTHORIZED);
-    assert_eq!(blocked_body["error"]["code"], "MFA_REQUIRED");
-
-    // Verify with 6-digit TOTP -> full session unlocks /notes
-    let code = current_totp_from_base32(&user.secret_base32);
-    let (verify_status, verify_headers, _) = send_json(
-        &harness.router,
-        Method::POST,
-        "/api/v1/auth/totp/verify",
-        Some(&pre_cookie),
-        Some(&pre_csrf),
-        Some("198.51.100.2"),
-        Some(json!({ "code": code })),
-    )
-    .await;
-    assert_eq!(verify_status, StatusCode::OK);
-    let full_cookie = extract_cookie_value(&verify_headers).unwrap();
     let (notes_status, _, _) = send_json(
         &harness.router,
         Method::GET,
@@ -491,71 +418,26 @@ async fn ca02_auth_login_2fa_blocks_pre_mfa_and_consumes_single_use_recovery_cod
     .await;
     assert_eq!(notes_status, StatusCode::OK);
 
-    // Login again and verify using a recovery code (lowercase, no hyphen)
-    let (_, h2, b2) = send_json(
-        &harness.router,
-        Method::POST,
-        "/api/v1/auth/login",
-        None,
-        None,
-        Some("198.51.100.2"),
-        Some(json!({ "email": "bob@example.com", "password": "BobStrongPass#2026" })),
-    )
-    .await;
-    let pre_cookie2 = extract_cookie_value(&h2).unwrap();
-    let pre_csrf2 = b2["data"]["csrf_token"].as_str().unwrap().to_owned();
-
-    let first_recovery = user.recovery_codes[0].replace('-', "").to_lowercase();
-    let (rec_status, rec_headers, _) = send_json(
-        &harness.router,
-        Method::POST,
-        "/api/v1/auth/totp/verify",
-        Some(&pre_cookie2),
-        Some(&pre_csrf2),
-        Some("198.51.100.2"),
-        Some(json!({ "recovery_code": first_recovery })),
-    )
-    .await;
-    assert_eq!(rec_status, StatusCode::OK);
-    let rec_cookie = extract_cookie_value(&rec_headers).unwrap();
-    let (ok_notes, _, _) = send_json(
-        &harness.router,
-        Method::GET,
-        "/api/v1/notes",
-        Some(&rec_cookie),
-        None,
-        None,
-        None,
-    )
-    .await;
-    assert_eq!(ok_notes, StatusCode::OK);
-
-    // Reusing the same recovery code must fail with 401 INVALID_RECOVERY_CODE
-    let (_, h3, b3) = send_json(
-        &harness.router,
-        Method::POST,
-        "/api/v1/auth/login",
-        None,
-        None,
-        Some("198.51.100.2"),
-        Some(json!({ "email": "bob@example.com", "password": "BobStrongPass#2026" })),
-    )
-    .await;
-    let pre_cookie3 = extract_cookie_value(&h3).unwrap();
-    let pre_csrf3 = b3["data"]["csrf_token"].as_str().unwrap().to_owned();
-
-    let (reuse_status, _, reuse_body) = send_json(
-        &harness.router,
-        Method::POST,
-        "/api/v1/auth/totp/verify",
-        Some(&pre_cookie3),
-        Some(&pre_csrf3),
-        Some("198.51.100.2"),
-        Some(json!({ "recovery_code": user.recovery_codes[0] })),
-    )
-    .await;
-    assert_eq!(reuse_status, StatusCode::UNAUTHORIZED);
-    assert_eq!(reuse_body["error"]["code"], "INVALID_RECOVERY_CODE");
+    // Removed TOTP endpoints MUST return 404 NOT_FOUND
+    for removed_route in ["/api/v1/auth/totp/confirm", "/api/v1/auth/totp/verify"] {
+        let (totp_status, _, totp_body) = send_json(
+            &harness.router,
+            Method::POST,
+            removed_route,
+            Some(&full_cookie),
+            Some(&full_csrf),
+            Some("198.51.100.2"),
+            Some(json!({ "code": "123456" })),
+        )
+        .await;
+        assert_eq!(
+            totp_status,
+            StatusCode::NOT_FOUND,
+            "expected 404 on removed route {removed_route}"
+        );
+        assert_eq!(totp_body["success"], false);
+        assert_eq!(totp_body["error"]["code"], "NOT_FOUND");
+    }
 }
 
 #[tokio::test]
@@ -598,8 +480,7 @@ async fn ca03_auth_and_notes_validation_rejects_unknown_fields_and_invalid_input
     assert_eq!(s2, StatusCode::BAD_REQUEST);
     assert_eq!(b2["error"]["code"], "VALIDATION_ERROR");
 
-    let user =
-        register_and_confirm_user(&harness.router, "val@example.com", "ValidPassword#2026").await;
+    let user = register_user(&harness.router, "val@example.com", "ValidPassword#2026").await;
 
     // Invalid category -> 400 VALIDATION_ERROR
     let (s3, _, b3) = send_json(
@@ -687,8 +568,7 @@ async fn ca03_auth_and_notes_validation_rejects_unknown_fields_and_invalid_input
 #[tokio::test]
 async fn ca04_empty_notes_list_and_paginated_category_filtering() {
     let harness = TestHarness::new();
-    let user =
-        register_and_confirm_user(&harness.router, "empty@example.com", "EmptyListPass#2026").await;
+    let user = register_user(&harness.router, "empty@example.com", "EmptyListPass#2026").await;
 
     let (status, _, body) = send_json(
         &harness.router,
@@ -747,12 +627,8 @@ async fn ca04_empty_notes_list_and_paginated_category_filtering() {
 #[tokio::test]
 async fn ca05_bola_isolation_between_users_and_csrf_protection() {
     let harness = TestHarness::new();
-    let user_a =
-        register_and_confirm_user(&harness.router, "usera@example.com", "UserAStrongPass#2026")
-            .await;
-    let user_b =
-        register_and_confirm_user(&harness.router, "userb@example.com", "UserBStrongPass#2026")
-            .await;
+    let user_a = register_user(&harness.router, "usera@example.com", "UserAStrongPass#2026").await;
+    let user_b = register_user(&harness.router, "userb@example.com", "UserBStrongPass#2026").await;
 
     let (status, _, created) = send_json(
         &harness.router,
@@ -854,8 +730,7 @@ async fn ca05_bola_isolation_between_users_and_csrf_protection() {
 #[tokio::test]
 async fn ca06_encryption_at_rest_tampering_alert_and_key_rotation_v1_to_v2() {
     let harness = TestHarness::new();
-    let user =
-        register_and_confirm_user(&harness.router, "crypto@example.com", "CryptoPass#2026!").await;
+    let user = register_user(&harness.router, "crypto@example.com", "CryptoPass#2026!").await;
 
     let secret_title = "Clave Maestra de Boveda";
     let secret_content = "frase-semilla-ultra-confidencial-2026";
@@ -893,14 +768,10 @@ async fn ca06_encryption_at_rest_tampering_alert_and_key_rotation_v1_to_v2() {
     );
 
     let raw_user = harness.store.inspect_user_raw(user.user_id).await.unwrap();
-    let raw_totp = BASE32_NOPAD.decode(user.secret_base32.as_bytes()).unwrap();
     assert_eq!(raw_user.totp_key_version, 1);
-    assert!(
-        !raw_user
-            .totp_secret_ciphertext
-            .windows(raw_totp.len())
-            .any(|w| w == raw_totp.as_slice())
-    );
+    assert!(!raw_user.totp_enabled);
+    assert_eq!(raw_user.totp_secret_ciphertext.len(), 36);
+    assert_eq!(raw_user.totp_secret_nonce.len(), 12);
 
     // Flip 1 byte of content_ciphertext -> 500 generic error + crypto_integrity_failure alert
     assert!(harness.store.tamper_note_content_byte(note_id).await);
@@ -1069,7 +940,7 @@ async fn ca07_auth_bruteforce_locks_account_and_sends_sanitized_webhook() {
     let wrong_password = "WrongPassword#2026!";
     let attacker_ip = "203.0.113.55";
 
-    let _ = register_and_confirm_user(&router, email, real_password).await;
+    let _ = register_user(&router, email, real_password).await;
 
     // Attempts 1..=4 return 401 INVALID_CREDENTIALS
     for _ in 0..4 {
@@ -1153,7 +1024,7 @@ async fn ca08_stalling_webhook_never_blocks_or_breaks_http_responses() {
     let config = make_config(AppEnv::Development, true, make_key_ring(1, &[(1, 0x11)]));
     let router = build_router(AppState::new(&config, repos, alerts));
 
-    let _ = register_and_confirm_user(&router, "resilient@example.com", "ResilientPass#2026").await;
+    let _ = register_user(&router, "resilient@example.com", "ResilientPass#2026").await;
 
     for _ in 0..4 {
         let (st, _, _) = send_json(
@@ -1291,71 +1162,8 @@ async fn healthz_and_security_headers_including_hsts_in_production() {
 }
 
 #[tokio::test]
-async fn ca07_auth_totp_bruteforce_lockout_and_ip_rate_limiting() {
-    // Part A: 5 invalid TOTP codes lock the account and emit auth_bruteforce alert
-    let harness = TestHarness::new();
-    let user =
-        register_and_confirm_user(&harness.router, "totplock@example.com", "TotpLockPass#2026")
-            .await;
-
-    let (login_st, login_h, login_b) = send_json(
-        &harness.router,
-        Method::POST,
-        "/api/v1/auth/login",
-        None,
-        None,
-        Some("198.51.100.33"),
-        Some(json!({ "email": "totplock@example.com", "password": "TotpLockPass#2026" })),
-    )
-    .await;
-    assert_eq!(login_st, StatusCode::OK);
-    let pre_cookie = extract_cookie_value(&login_h).unwrap();
-    let pre_csrf = login_b["data"]["csrf_token"].as_str().unwrap().to_owned();
-
-    // Pick a deterministic 6-digit code guaranteed not to match current ±1 window.
-    let raw_secret = BASE32_NOPAD.decode(user.secret_base32.as_bytes()).unwrap();
-    let wrong_code = ["000000", "111111", "222222", "333333"]
-        .into_iter()
-        .find(|candidate| !verify_totp_now(&raw_secret, candidate).unwrap())
-        .unwrap();
-
-    for _ in 0..4 {
-        let (st, _, b) = send_json(
-            &harness.router,
-            Method::POST,
-            "/api/v1/auth/totp/verify",
-            Some(&pre_cookie),
-            Some(&pre_csrf),
-            Some("198.51.100.33"),
-            Some(json!({ "code": wrong_code })),
-        )
-        .await;
-        assert_eq!(st, StatusCode::UNAUTHORIZED);
-        assert_eq!(b["error"]["code"], "INVALID_TOTP_CODE");
-    }
-
-    let (st5, _, b5) = send_json(
-        &harness.router,
-        Method::POST,
-        "/api/v1/auth/totp/verify",
-        Some(&pre_cookie),
-        Some(&pre_csrf),
-        Some("198.51.100.33"),
-        Some(json!({ "code": wrong_code })),
-    )
-    .await;
-    assert_eq!(st5, StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(b5["error"]["code"], "ACCOUNT_LOCKED");
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let alerts = harness.alerts_sink.captured().await;
-    assert!(
-        alerts
-            .iter()
-            .any(|a| a.event == "auth_bruteforce" && a.code == "ACCOUNT_LOCKED")
-    );
-
-    // Part B: Per-IP rate limiter returns 429 RATE_LIMITED
+async fn ca07_ip_rate_limiting_returns_429() {
+    // Per-IP rate limiter returns 429 RATE_LIMITED
     let strict_rl = TestHarness::with_options(
         AppEnv::Development,
         true,
@@ -1480,7 +1288,7 @@ async fn ca07_internal_5xx_returns_generic_message_and_emits_http_5xx_alert() {
     let config = make_config(AppEnv::Development, true, make_key_ring(1, &[(1, 0x11)]));
     let router = build_router(AppState::new(&config, repos, alerts));
 
-    let user = register_and_confirm_user(&router, "err500@example.com", "Err500Pass#2026!").await;
+    let user = register_user(&router, "err500@example.com", "Err500Pass#2026!").await;
 
     let (status, _, body) = send_json(
         &router,

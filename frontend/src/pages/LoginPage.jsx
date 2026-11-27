@@ -7,7 +7,7 @@ import { useAuth } from '../context/AuthContext';
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 export function LoginPage() {
-  const { status, authenticated, mfaVerified, login } = useAuth();
+  const { status, authenticated, login } = useAuth();
   const navigate = useNavigate();
 
   const [email, setEmail] = useState('');
@@ -27,7 +27,7 @@ export function LoginPage() {
     );
   }
 
-  if (authenticated && mfaVerified) {
+  if (authenticated) {
     return <Navigate to="/vault" replace />;
   }
 
@@ -56,12 +56,8 @@ export function LoginPage() {
     setIsSubmitting(true);
 
     try {
-      const data = await login({ email, password });
-      if (data && data.totp_enrolled === false) {
-        navigate('/totp-setup', { replace: true });
-      } else {
-        navigate('/totp-verify', { replace: true });
-      }
+      await login({ email, password });
+      navigate('/vault', { replace: true });
     } catch (err) {
       setServerError(err.message || 'No se pudo iniciar sesión.');
     } finally {
@@ -77,7 +73,7 @@ export function LoginPage() {
             Iniciar sesión
           </h1>
           <p className="sv-card-subtitle">
-            Paso 1 de 2: ingresa tus credenciales para continuar con la verificación TOTP.
+            Ingresa tu correo electrónico y contraseña para abrir tu bóveda.
           </p>
 
           <AlertBanner
@@ -160,7 +156,7 @@ export function LoginPage() {
               className="sv-btn sv-btn-primary"
               disabled={isSubmitting}
             >
-              {isSubmitting ? 'Verificando…' : 'Continuar'}
+              {isSubmitting ? 'Iniciando sesión…' : 'Iniciar sesión'}
             </button>
           </form>
 

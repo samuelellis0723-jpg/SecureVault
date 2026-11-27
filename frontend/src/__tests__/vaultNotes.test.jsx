@@ -27,11 +27,9 @@ const AUTH_ME_OK = {
   success: true,
   data: {
     authenticated: true,
-    mfa_verified: true,
     user: {
       id: '550e8400-e29b-41d4-a716-446655440000',
       email: 'ana@ejemplo.com',
-      totp_enabled: true,
     },
     csrf_token: 'csrf-vault-token',
   },
@@ -50,6 +48,16 @@ describe('Bóveda de notas cifradas (estados UI, CRUD, filtrado y CSRF)', () => 
 
   afterAll(() => {
     global.fetch = originalFetch;
+  });
+
+  test('muestra estado loading mientras se cargan las notas cifradas', async () => {
+    global.fetch
+      .mockResolvedValueOnce(createJsonResponse(AUTH_ME_OK))
+      .mockReturnValueOnce(new Promise(() => {}));
+
+    renderVault();
+
+    expect(await screen.findByText(/cargando notas cifradas/i)).toBeInTheDocument();
   });
 
   test('muestra estado empty cuando el usuario no tiene notas', async () => {

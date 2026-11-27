@@ -1,4 +1,4 @@
-//! Authentication, mandatory TOTP MFA, session rotation, CSRF, and brute-force lockout service.
+//! Authentication, session management, CSRF, and brute-force lockout service.
 
 use rand::{RngCore, rngs::OsRng};
 use secrecy::{ExposeSecret, SecretString};
@@ -9,32 +9,21 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::crypto::{
-    CryptoError,
     cipher::{AAD_ENTITY_TOTP_SECRET, KeyRing},
     password::{hash_password, validate_password, verify_password},
-    totp::{
-        TOTP_DIGITS, TOTP_SECRET_LEN, build_totp_enrollment, generate_recovery_codes,
-        generate_totp_secret, hash_recovery_code_bytes, keyed_sha256_bytes, keyed_sha256_hex,
-        normalize_recovery_code, sha256_bytes, verify_totp_now,
-    },
+    totp::{generate_totp_secret, keyed_sha256_bytes, keyed_sha256_hex, sha256_bytes},
 };
 use crate::domain::{
     error::AppError,
-    models::{
-        AuthAttemptRecord, AuthAttemptType, RecoveryCodeRecord, SessionRecord, UserPublic,
-        UserRecord,
-    },
+    models::{AuthAttemptRecord, AuthAttemptType, SessionRecord, UserPublic, UserRecord},
 };
 use crate::repositories::VaultRepositories;
 use crate::services::alerts::{AlertEventKind, AlertService};
 
-/// Pre-MFA session lifetime (5 minutes).
-pub const PRE_MFA_SESSION_TTL_SECS: i64 = 5 * 60;
-
-/// Full MFA-verified session absolute lifetime (8 hours).
+/// Full authenticated session absolute lifetime (8 hours).
 pub const FULL_SESSION_TTL_SECS: i64 = 8 * 60 * 60;
 
-/// Full MFA-verified session inactivity timeout (30 minutes).
+/// Full authenticated session inactivity timeout (30 minutes).
 pub const SESSION_INACTIVITY_TTL_SECS: i64 = 30 * 60;
 
 /// Consecutive/window failure threshold triggering a 15-minute lockout and webhook alert.
@@ -60,43 +49,8 @@ pub struct AuthenticatedSession {
     pub raw_token: SecretString,
 }
 
-/// TOTP setup payload returned during registration or incomplete enrollment login.
-#[derive(Debug, Clone, Serialize)]
-pub struct TotpSetupDto {
-    pub otpauth_uri: String,
-    pub secret_base32: String,
-    pub qr_svg: String,
-}
-
-/// Output of `POST /api/v1/auth/register`.
-pub struct RegisterOutput {
-    pub session_token: SecretString,
-    pub session_max_age_secs: i64,
-    pub csrf_token: String,
-    pub totp: TotpSetupDto,
-}
-
-/// Output of `POST /api/v1/auth/totp/confirm`.
-pub struct ConfirmTotpOutput {
-    pub user: UserPublic,
-    pub session_token: SecretString,
-    pub session_max_age_secs: i64,
-    pub csrf_token: String,
-    pub recovery_codes: Vec<String>,
-}
-
-/// Output of `POST /api/v1/auth/login`.
-pub struct LoginOutput {
-    pub mfa_required: bool,
-    pub totp_enrolled: bool,
-    pub csrf_token: String,
-    pub totp: Option<TotpSetupDto>,
-    pub session_token: SecretString,
-    pub session_max_age_secs: i64,
-}
-
-/// Output of `POST /api/v1/auth/totp/verify`.
-pub struct VerifyTotpOutput {
+/// Output of `POST /api/v1/auth/register` and `POST /api/v1/auth/login`.
+pub struct AuthSessionOutput {
     pub user: UserPublic,
     pub session_token: SecretString,
     pub session_max_age_secs: i64,
@@ -107,12 +61,11 @@ pub struct VerifyTotpOutput {
 #[derive(Debug, Clone, Serialize)]
 pub struct MeOutput {
     pub authenticated: bool,
-    pub mfa_verified: bool,
     pub user: UserPublic,
     pub csrf_token: String,
 }
 
-/// Core authentication and MFA service.
+/// Core authentication, session, CSRF, and lockout service.
 #[derive(Clone)]
 pub struct AuthService {
     repos: VaultRepositories,
@@ -141,13 +94,14 @@ impl AuthService {
         }
     }
 
-    /// Registers a new user (when `ALLOW_REGISTRATION=true`), encrypts their TOTP secret,
-    /// and opens a 5-minute pre-MFA session.
+    /// Registers a new user (when `ALLOW_REGISTRATION=true`), persists schema-compatible
+    /// encrypted placeholder bytes in `totp_secret_*` with `totp_enabled = false`,
+    /// and immediately opens a full authenticated session (8h absolute / 30min inactivity).
     pub async fn register(
         &self,
         email: &str,
         password: SecretString,
-    ) -> Result<RegisterOutput, AppError> {
+    ) -> Result<AuthSessionOutput, AppError> {
         if !self.allow_registration {
             return Err(AppError::RegistrationDisabled);
         }
@@ -157,11 +111,12 @@ impl AuthService {
 
         let password_hash = hash_password(password).await?;
         let user_id = Uuid::new_v4();
-        let raw_totp_secret = generate_totp_secret();
-        let enrollment = build_totp_enrollment(&normalized_email, raw_totp_secret)?;
 
+        // Keep full compatibility with the existing PostgreSQL schema constraints
+        // (NOT NULL ciphertext + 12-byte nonce + key_version >= 1) without requiring migrations.
+        let raw_totp_placeholder = generate_totp_secret();
         let encrypted_totp = self.key_ring.encrypt(
-            &enrollment.raw_secret[..],
+            &raw_totp_placeholder[..],
             user_id,
             AAD_ENTITY_TOTP_SECRET,
             user_id,
@@ -184,134 +139,26 @@ impl AuthService {
 
         let created = self.repos.users.create_user(user).await?;
         let (session_token, csrf_token) = self
-            .issue_session(created.id, false, PRE_MFA_SESSION_TTL_SECS)
+            .issue_session(created.id, true, FULL_SESSION_TTL_SECS)
             .await?;
 
-        Ok(RegisterOutput {
-            session_token,
-            session_max_age_secs: PRE_MFA_SESSION_TTL_SECS,
-            csrf_token,
-            totp: TotpSetupDto {
-                otpauth_uri: enrollment.otpauth_uri.expose_secret().to_owned(),
-                secret_base32: enrollment.secret_base32.expose_secret().to_owned(),
-                qr_svg: enrollment.qr_svg,
-            },
-        })
-    }
-
-    /// Confirms initial TOTP enrollment, enables MFA, rotates session to `mfa_verified = true`,
-    /// and returns 8 single-use recovery codes once.
-    pub async fn confirm_totp(
-        &self,
-        auth_session: &AuthenticatedSession,
-        code: &str,
-        client_ip: &str,
-        request_id: &str,
-    ) -> Result<ConfirmTotpOutput, AppError> {
-        let trimmed_code = validate_totp_code_format(code)?;
-
-        let user = self
-            .repos
-            .users
-            .find_user_by_id(auth_session.session.user_id)
-            .await?
-            .ok_or_else(|| AppError::Unauthorized("Sesión no válida".to_owned()))?;
-
-        if user.totp_enabled {
-            return Err(AppError::conflict(
-                "TOTP_ALREADY_ENABLED",
-                "El segundo factor TOTP ya está activado para esta cuenta",
-            ));
-        }
-
-        let now = OffsetDateTime::now_utc();
-        if is_locked(&user, now) {
-            return Err(AppError::AccountLocked);
-        }
-
-        let totp_secret = self.decrypt_user_totp_secret(&user, client_ip, request_id)?;
-        let valid = verify_totp_now(&totp_secret[..], trimmed_code)?;
-
-        let identifier_hash = self.hash_identifier(&user.email)?;
-        let ip_hash = self.hash_ip(client_ip)?;
-        self.repos
-            .auth_attempts
-            .record_attempt(AuthAttemptRecord {
-                id: Uuid::new_v4(),
-                identifier_hash,
-                ip_hash,
-                attempt_type: AuthAttemptType::Totp,
-                succeeded: valid,
-                created_at: now,
-            })
-            .await?;
-
-        if !valid {
-            let locked = self
-                .record_failure_and_check_lockout(
-                    Some(&user),
-                    identifier_hash,
-                    now,
-                    client_ip,
-                    request_id,
-                )
-                .await?;
-            if locked {
-                return Err(AppError::AccountLocked);
-            }
-            return Err(AppError::InvalidTotpCode);
-        }
-
-        let raw_recovery_codes = generate_recovery_codes();
-        let mut recovery_records = Vec::with_capacity(raw_recovery_codes.len());
-        let mut recovery_plain = Vec::with_capacity(raw_recovery_codes.len());
-
-        for secret_code in raw_recovery_codes {
-            let plain = secret_code.expose_secret().to_owned();
-            let code_hash = hash_recovery_code_bytes(&plain, &self.pepper)?;
-            recovery_records.push(RecoveryCodeRecord {
-                id: Uuid::new_v4(),
-                user_id: user.id,
-                code_hash,
-                used_at: None,
-                created_at: now,
-            });
-            recovery_plain.push(plain);
-        }
-
-        let updated_user = self
-            .repos
-            .users
-            .enable_totp_and_store_recovery_codes(user.id, recovery_records)
-            .await?;
-
-        // Rotate session to prevent session fixation: revoke pre-MFA session, issue full session.
-        self.repos
-            .sessions
-            .revoke_session(auth_session.session.id, now)
-            .await?;
-        let (session_token, csrf_token) = self
-            .issue_session(updated_user.id, true, FULL_SESSION_TTL_SECS)
-            .await?;
-
-        Ok(ConfirmTotpOutput {
-            user: UserPublic::from(&updated_user),
+        Ok(AuthSessionOutput {
+            user: UserPublic::from(&created),
             session_token,
             session_max_age_secs: FULL_SESSION_TTL_SECS,
             csrf_token,
-            recovery_codes: recovery_plain,
         })
     }
 
     /// Verifies email + password (with Argon2id timing-attack mitigation for missing users),
-    /// enforces brute-force lockout, and creates a 5-minute pre-MFA session.
+    /// enforces brute-force lockout, and opens a full authenticated session (8h absolute / 30min inactivity).
     pub async fn login(
         &self,
         email: &str,
         password: SecretString,
         client_ip: &str,
         request_id: &str,
-    ) -> Result<LoginOutput, AppError> {
+    ) -> Result<AuthSessionOutput, AppError> {
         let normalized_email = normalize_and_validate_email(email)?;
         if password.expose_secret().is_empty()
             || password.expose_secret().len() > MAX_LOGIN_PASSWORD_BYTES
@@ -377,143 +224,10 @@ impl AuthService {
 
         self.repos.users.reset_login_failures(user.id).await?;
         let (session_token, csrf_token) = self
-            .issue_session(user.id, false, PRE_MFA_SESSION_TTL_SECS)
-            .await?;
-
-        let totp = if user.totp_enabled {
-            None
-        } else {
-            let secret_vec = self.decrypt_user_totp_secret(&user, client_ip, request_id)?;
-            let raw_arr: [u8; TOTP_SECRET_LEN] = secret_vec
-                .as_slice()
-                .try_into()
-                .map_err(|_| AppError::CryptoIntegrity("invalid totp secret length".to_owned()))?;
-            let enrollment = build_totp_enrollment(&user.email, Zeroizing::new(raw_arr))?;
-            Some(TotpSetupDto {
-                otpauth_uri: enrollment.otpauth_uri.expose_secret().to_owned(),
-                secret_base32: enrollment.secret_base32.expose_secret().to_owned(),
-                qr_svg: enrollment.qr_svg,
-            })
-        };
-
-        Ok(LoginOutput {
-            mfa_required: true,
-            totp_enrolled: user.totp_enabled,
-            csrf_token,
-            totp,
-            session_token,
-            session_max_age_secs: PRE_MFA_SESSION_TTL_SECS,
-        })
-    }
-
-    /// Completes second-factor authentication using either a 6-digit TOTP code or a single-use
-    /// recovery code, rotating the session to `mfa_verified = true`.
-    pub async fn verify_totp(
-        &self,
-        auth_session: &AuthenticatedSession,
-        code: Option<&str>,
-        recovery_code: Option<&str>,
-        client_ip: &str,
-        request_id: &str,
-    ) -> Result<VerifyTotpOutput, AppError> {
-        let mode = match (code, recovery_code) {
-            (Some(c), None) => VerificationMode::Totp(validate_totp_code_format(c)?),
-            (None, Some(r)) => {
-                if normalize_recovery_code(r).is_none() {
-                    return Err(AppError::validation(
-                        "Formato de código de recuperación inválido",
-                    ));
-                }
-                VerificationMode::Recovery(r)
-            }
-            _ => {
-                return Err(AppError::validation(
-                    "Debes enviar exactamente 'code' o 'recovery_code'",
-                ));
-            }
-        };
-
-        let user = self
-            .repos
-            .users
-            .find_user_by_id(auth_session.session.user_id)
-            .await?
-            .ok_or_else(|| AppError::Unauthorized("Sesión no válida".to_owned()))?;
-
-        if !user.totp_enabled {
-            return Err(AppError::Forbidden(
-                "Debes confirmar el enrolamiento TOTP antes de verificar".to_owned(),
-            ));
-        }
-
-        let now = OffsetDateTime::now_utc();
-        if is_locked(&user, now) {
-            return Err(AppError::AccountLocked);
-        }
-
-        let identifier_hash = self.hash_identifier(&user.email)?;
-        let ip_hash = self.hash_ip(client_ip)?;
-
-        let (valid, attempt_type, invalid_err) = match mode {
-            VerificationMode::Totp(trimmed_code) => {
-                let secret = self.decrypt_user_totp_secret(&user, client_ip, request_id)?;
-                let ok = verify_totp_now(&secret[..], trimmed_code)?;
-                (ok, AuthAttemptType::Totp, AppError::InvalidTotpCode)
-            }
-            VerificationMode::Recovery(raw_recovery) => {
-                let code_hash = hash_recovery_code_bytes(raw_recovery, &self.pepper)?;
-                let consumed = self
-                    .repos
-                    .users
-                    .consume_recovery_code(user.id, code_hash, now)
-                    .await?;
-                (
-                    consumed,
-                    AuthAttemptType::Recovery,
-                    AppError::InvalidRecoveryCode,
-                )
-            }
-        };
-
-        self.repos
-            .auth_attempts
-            .record_attempt(AuthAttemptRecord {
-                id: Uuid::new_v4(),
-                identifier_hash,
-                ip_hash,
-                attempt_type,
-                succeeded: valid,
-                created_at: now,
-            })
-            .await?;
-
-        if !valid {
-            let locked = self
-                .record_failure_and_check_lockout(
-                    Some(&user),
-                    identifier_hash,
-                    now,
-                    client_ip,
-                    request_id,
-                )
-                .await?;
-            if locked {
-                return Err(AppError::AccountLocked);
-            }
-            return Err(invalid_err);
-        }
-
-        self.repos.users.reset_login_failures(user.id).await?;
-        self.repos
-            .sessions
-            .revoke_session(auth_session.session.id, now)
-            .await?;
-
-        let (session_token, csrf_token) = self
             .issue_session(user.id, true, FULL_SESSION_TTL_SECS)
             .await?;
 
-        Ok(VerifyTotpOutput {
+        Ok(AuthSessionOutput {
             user: UserPublic::from(&user),
             session_token,
             session_max_age_secs: FULL_SESSION_TTL_SECS,
@@ -530,8 +244,9 @@ impl AuthService {
             .await
     }
 
-    /// Resolves and validates a session from the opaque cookie token, enforcing absolute
-    /// expiration, revocation, and 30-minute inactivity timeout for MFA-verified sessions.
+    /// Resolves and validates a session from the opaque cookie token, enforcing
+    /// completion (`mfa_verified = true`), absolute expiration, revocation,
+    /// and 30-minute inactivity timeout.
     pub async fn authenticate_session(
         &self,
         raw_token: &str,
@@ -550,22 +265,20 @@ impl AuthService {
             .ok_or_else(|| AppError::Unauthorized("Sesión inválida o expirada".to_owned()))?;
 
         let now = OffsetDateTime::now_utc();
-        if session.revoked_at.is_some() || session.expires_at <= now {
+        if session.revoked_at.is_some() || session.expires_at <= now || !session.mfa_verified {
             return Err(AppError::Unauthorized(
                 "Sesión revocada o expirada".to_owned(),
             ));
         }
 
-        if session.mfa_verified {
-            let inactivity_deadline =
-                session.last_seen_at + Duration::seconds(SESSION_INACTIVITY_TTL_SECS);
-            if inactivity_deadline <= now {
-                return Err(AppError::Unauthorized(
-                    "Sesión expirada por inactividad".to_owned(),
-                ));
-            }
-            self.repos.sessions.touch_session(session.id, now).await?;
+        let inactivity_deadline =
+            session.last_seen_at + Duration::seconds(SESSION_INACTIVITY_TTL_SECS);
+        if inactivity_deadline <= now {
+            return Err(AppError::Unauthorized(
+                "Sesión expirada por inactividad".to_owned(),
+            ));
         }
+        self.repos.sessions.touch_session(session.id, now).await?;
 
         Ok(AuthenticatedSession {
             session,
@@ -593,7 +306,6 @@ impl AuthService {
 
         Ok(MeOutput {
             authenticated: true,
-            mfa_verified: auth_session.session.mfa_verified,
             user: UserPublic::from(&user),
             csrf_token,
         })
@@ -658,39 +370,6 @@ impl AuthService {
         keyed_sha256_bytes(&self.pepper, "auth-ip", client_ip.trim()).map_err(AppError::from)
     }
 
-    fn decrypt_user_totp_secret(
-        &self,
-        user: &UserRecord,
-        client_ip: &str,
-        request_id: &str,
-    ) -> Result<Zeroizing<Vec<u8>>, AppError> {
-        self.key_ring
-            .decrypt_parts(
-                &user.totp_secret_ciphertext,
-                &user.totp_secret_nonce,
-                user.totp_key_version,
-                user.id,
-                AAD_ENTITY_TOTP_SECRET,
-                user.id,
-            )
-            .map_err(|err| {
-                if matches!(
-                    err,
-                    CryptoError::IntegrityFailure
-                        | CryptoError::KeyVersionNotFound(_)
-                        | CryptoError::InvalidNonceLength
-                ) {
-                    self.alerts.notify(
-                        AlertEventKind::CryptoIntegrityFailure,
-                        request_id,
-                        client_ip,
-                        "INTERNAL_ERROR",
-                    );
-                }
-                AppError::from(err)
-            })
-    }
-
     async fn record_failure_and_check_lockout(
         &self,
         user_opt: Option<&UserRecord>,
@@ -753,11 +432,6 @@ impl AuthService {
     }
 }
 
-enum VerificationMode<'a> {
-    Totp(&'a str),
-    Recovery(&'a str),
-}
-
 fn is_locked(user: &UserRecord, now: OffsetDateTime) -> bool {
     user.locked_until.is_some_and(|until| until > now)
 }
@@ -805,17 +479,6 @@ pub fn normalize_and_validate_email(raw: &str) -> Result<String, AppError> {
     }
 
     Ok(normalized)
-}
-
-fn validate_totp_code_format(raw: &str) -> Result<&str, AppError> {
-    let trimmed = raw.trim();
-    if trimmed.len() == TOTP_DIGITS && trimmed.bytes().all(|b| b.is_ascii_digit()) {
-        Ok(trimmed)
-    } else {
-        Err(AppError::validation(
-            "El código TOTP debe tener exactamente 6 dígitos numéricos",
-        ))
-    }
 }
 
 #[cfg(test)]

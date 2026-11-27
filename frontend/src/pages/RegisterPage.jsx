@@ -9,7 +9,7 @@ const MIN_PASSWORD_LENGTH = 12;
 const MAX_PASSWORD_LENGTH = 128;
 
 export function RegisterPage() {
-  const { status, authenticated, mfaVerified, register } = useAuth();
+  const { status, authenticated, register } = useAuth();
   const navigate = useNavigate();
 
   const [email, setEmail] = useState('');
@@ -29,7 +29,7 @@ export function RegisterPage() {
     );
   }
 
-  if (authenticated && mfaVerified) {
+  if (authenticated) {
     return <Navigate to="/vault" replace />;
   }
 
@@ -66,7 +66,7 @@ export function RegisterPage() {
 
     try {
       await register({ email, password });
-      navigate('/totp-setup', { replace: true });
+      navigate('/vault', { replace: true });
     } catch (err) {
       setServerError(err.message || 'No se pudo crear la cuenta.');
     } finally {
@@ -82,7 +82,7 @@ export function RegisterPage() {
             Crear cuenta
           </h1>
           <p className="sv-card-subtitle">
-            Crea tu bóveda privada. En el siguiente paso configurarás tu autenticador TOTP obligatorio.
+            Crea tu cuenta para acceder a tu bóveda privada de notas cifradas.
           </p>
 
           <AlertBanner
@@ -191,7 +191,7 @@ export function RegisterPage() {
               className="sv-btn sv-btn-primary"
               disabled={isSubmitting}
             >
-              {isSubmitting ? 'Creando cuenta…' : 'Crear cuenta y configurar MFA'}
+              {isSubmitting ? 'Creando cuenta…' : 'Crear cuenta'}
             </button>
           </form>
 

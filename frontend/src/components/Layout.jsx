@@ -3,7 +3,7 @@ import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 
 export function Layout({ children }) {
-  const { authenticated, mfaVerified, user, logout } = useAuth();
+  const { authenticated, user, logout } = useAuth();
   const [loggingOut, setLoggingOut] = useState(false);
   const location = useLocation();
   const navigate = useNavigate();
@@ -18,7 +18,7 @@ export function Layout({ children }) {
     }
   }
 
-  const brandTarget = authenticated && mfaVerified ? '/vault' : '/login';
+  const brandTarget = authenticated ? '/vault' : '/login';
 
   return (
     <div className="sv-shell">
@@ -90,7 +90,7 @@ export function Layout({ children }) {
       </main>
 
       <footer className="sv-footer">
-        SecurityVault · Cifrado AES-256-GCM en servidor y verificación TOTP obligatoria.
+        SecurityVault · Cifrado AES-256-GCM en servidor y sesiones seguras.
       </footer>
     </div>
   );

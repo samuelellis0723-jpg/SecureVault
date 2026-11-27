@@ -17,7 +17,7 @@ use crate::domain::{
 };
 use crate::http::{
     AppState,
-    auth_handlers::{require_mfa_session, require_mfa_session_with_csrf},
+    auth_handlers::{require_session, require_session_with_csrf},
     middleware::{RequestMeta, ValidatedJson},
 };
 use crate::services::notes::{DEFAULT_LIMIT, DEFAULT_PAGE};
@@ -53,7 +53,7 @@ pub async fn list_notes(
     headers: HeaderMap,
     Query(params): Query<Vec<(String, String)>>,
 ) -> Result<Response, AppError> {
-    let auth_session = require_mfa_session(&state, &headers).await?;
+    let auth_session = require_session(&state, &headers).await?;
     let (page, limit, category) = parse_list_query(&params)?;
 
     let (items, pagination) = state
@@ -81,7 +81,7 @@ pub async fn create_note(
     headers: HeaderMap,
     ValidatedJson(payload): ValidatedJson<CreateNoteRequest>,
 ) -> Result<Response, AppError> {
-    let auth_session = require_mfa_session_with_csrf(&state, &headers).await?;
+    let auth_session = require_session_with_csrf(&state, &headers).await?;
 
     let created = state
         .notes
@@ -103,7 +103,7 @@ pub async fn get_note(
     headers: HeaderMap,
     Path(raw_id): Path<String>,
 ) -> Result<Response, AppError> {
-    let auth_session = require_mfa_session(&state, &headers).await?;
+    let auth_session = require_session(&state, &headers).await?;
     let note_id = parse_uuid(&raw_id)?;
 
     let note = state
@@ -127,7 +127,7 @@ pub async fn update_note(
     Path(raw_id): Path<String>,
     ValidatedJson(payload): ValidatedJson<UpdateNoteRequest>,
 ) -> Result<Response, AppError> {
-    let auth_session = require_mfa_session_with_csrf(&state, &headers).await?;
+    let auth_session = require_session_with_csrf(&state, &headers).await?;
     let note_id = parse_uuid(&raw_id)?;
 
     let updated = state
@@ -152,7 +152,7 @@ pub async fn delete_note(
     headers: HeaderMap,
     Path(raw_id): Path<String>,
 ) -> Result<Response, AppError> {
-    let auth_session = require_mfa_session_with_csrf(&state, &headers).await?;
+    let auth_session = require_session_with_csrf(&state, &headers).await?;
     let note_id = parse_uuid(&raw_id)?;
 
     state
