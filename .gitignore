@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Rust build artifacts (keep Cargo.lock versioned for reproducible builds)
+backend/target/
+
+# Environment variables (never commit real secrets)
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+
+# Build outputs
+dist/
+build/
+coverage/
+
+# OS and IDE files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Note: The symlink 'cerebro' points to local cerebro-agentes vault
+# cerebro

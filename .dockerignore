@@ -1,0 +1,27 @@
+# Version control & agent metadata
+.git
+.gitignore
+.github
+.agents
+cerebro
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+
+# Local environment secrets
+.env
+.env.*
+!.env.example
+
+# Build artifacts & dependencies
+backend/target
+frontend/node_modules
+frontend/dist
+frontend/coverage
+
+# Documentation & OS noise
+docs/
+README.md
+*.log
+.DS_Store
+Thumbs.db

@@ -1,0 +1,11 @@
+{
+  "entries": [
+    { "path": "/home/panterita/Documents/ReposDeSkills/cerebro-agentes/skills/orchestrator" },
+    { "path": "/home/panterita/Documents/ReposDeSkills/cerebro-agentes/skills/core" },
+    { "path": "/home/panterita/Documents/ReposDeSkills/cerebro-agentes/skills/backend" },
+    { "path": "/home/panterita/Documents/ReposDeSkills/cerebro-agentes/skills/frontend" },
+    { "path": "/home/panterita/Documents/ReposDeSkills/cerebro-agentes/skills/database" },
+    { "path": "/home/panterita/Documents/ReposDeSkills/cerebro-agentes/skills/qa" },
+    { "path": "/home/panterita/Documents/ReposDeSkills/cerebro-agentes/skills/security" }
+  ]
+}
